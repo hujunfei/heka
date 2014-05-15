@@ -25,6 +25,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -53,6 +54,10 @@ type ElasticSearchOutput struct {
 	bulkIndexer BulkIndexer
 	// Specify the document id or field name
 	id string
+
+	// Specify a timeout value in milliseconds for bulk request to complete.
+	// Default is 0 (infinite)
+	http_timeout	     uint32
 }
 
 // ConfigStruct for ElasticSearchOutput plugin.
@@ -88,6 +93,10 @@ type ElasticSearchOutputConfig struct {
 	ESIndexFromTimestamp bool
 	// Document ID
 	Id string
+	// Timeout
+	HTTPTimeout uint32 `toml:"http_timeout"`
+	// Fields to ignore formatting on
+	RawBytesFields []string `toml:"raw_bytes_fields"`
 }
 
 func (o *ElasticSearchOutput) ConfigStruct() interface{} {
@@ -102,6 +111,7 @@ func (o *ElasticSearchOutput) ConfigStruct() interface{} {
 		Server:               "http://localhost:9200",
 		ESIndexFromTimestamp: false,
 		Id:                   "",
+		HTTPTimeout:	      0,
 	}
 }
 
@@ -117,13 +127,14 @@ func (o *ElasticSearchOutput) Init(config interface{}) (err error) {
 	o.format = conf.Format
 	o.esIndexFromTimestamp = conf.ESIndexFromTimestamp
 	o.id = conf.Id
+	o.http_timeout = conf.HTTPTimeout
 	switch strings.ToLower(conf.Format) {
 	case "raw":
 		o.messageFormatter = NewRawMessageFormatter()
 	case "clean":
-		o.messageFormatter = NewCleanMessageFormatter(conf.Fields, conf.Timestamp)
+		o.messageFormatter = NewCleanMessageFormatter(conf.Fields, conf.Timestamp, conf.RawBytesFields)
 	case "logstash_v0":
-		o.messageFormatter = new(KibanaFormatter)
+		o.messageFormatter = NewKibanaFormatter(conf.RawBytesFields)
 	case "payload":
 		o.messageFormatter = new(PayloadFormatter)
 	default:
@@ -134,7 +145,7 @@ func (o *ElasticSearchOutput) Init(config interface{}) (err error) {
 		switch strings.ToLower(serverUrl.Scheme) {
 		case "http", "https":
 			o.bulkIndexer = NewHttpBulkIndexer(strings.ToLower(serverUrl.Scheme), serverUrl.Host,
-				o.flushCount)
+				o.flushCount, o.http_timeout)
 		case "udp":
 			o.bulkIndexer = NewUDPBulkIndexer(serverUrl.Host, o.flushCount)
 		}
@@ -294,12 +305,20 @@ type CleanMessageFormatter struct {
 	// Field names to include in ElasticSearch document for "clean" format
 	fields          []string
 	timestampFormat string
+	rawBytesFields  []string
 }
 
 type KibanaFormatter struct {
+	rawBytesFields  []string
 }
 
-func NewCleanMessageFormatter(fields []string, timestampFormat string) *CleanMessageFormatter {
+func NewKibanaFormatter(rawBytesFields []string) *KibanaFormatter {
+        return &KibanaFormatter{
+                rawBytesFields: rawBytesFields,
+        }
+}
+
+func NewCleanMessageFormatter(fields []string, timestampFormat string, rawBytesFields []string) *CleanMessageFormatter {
 	if fields == nil || len(fields) == 0 {
 		return &CleanMessageFormatter{
 			fields: []string{
@@ -315,9 +334,10 @@ func NewCleanMessageFormatter(fields []string, timestampFormat string) *CleanMes
 				"Fields",
 			},
 			timestampFormat: timestampFormat,
+			rawBytesFields: rawBytesFields,
 		}
 	} else {
-		return &CleanMessageFormatter{fields: fields, timestampFormat: timestampFormat}
+		return &CleanMessageFormatter{fields: fields, timestampFormat: timestampFormat, rawBytesFields: rawBytesFields}
 	}
 }
 
@@ -426,26 +446,42 @@ func (c *KibanaFormatter) Format(m *message.Message) (doc []byte, err error) {
 
 	buf.WriteString(`,"@fields":{`)
 	first := true
+	raw := false
 	for _, field := range m.Fields {
-		switch field.GetValueType() {
-		case message.Field_STRING:
-			writeStringField(first, &buf, *field.Name, field.GetValue().(string))
-			first = false
-		case message.Field_BYTES:
-			data := field.GetValue().([]byte)[:]
-			writeStringField(first, &buf, *field.Name, base64.StdEncoding.EncodeToString(data))
-			first = false
-		case message.Field_INTEGER:
-			writeRawField(first, &buf, *field.Name, strconv.FormatInt(field.GetValue().(int64), 10))
-			first = false
-		case message.Field_DOUBLE:
-			writeRawField(first, &buf, *field.Name, strconv.FormatFloat(field.GetValue().(float64),
-				'g', -1, 64))
-			first = false
-		case message.Field_BOOL:
-			writeRawField(first, &buf, *field.Name, strconv.FormatBool(field.GetValue().(bool)))
-			first = false
-		}
+                if len(c.rawBytesFields) > 0 {
+                        for _, raw_field_name := range c.rawBytesFields {
+                                if *field.Name == raw_field_name {
+                                        raw = true
+                                }
+                        }
+                }
+
+                if raw {
+                        data := field.GetValue().([]byte)[:]
+                        writeField(&buf, *field.Name, string(data))
+                        first = false
+                        raw = false
+                } else {
+                        switch field.GetValueType() {
+                        case message.Field_STRING:
+                                writeStringField(first, &buf, *field.Name, field.GetValue().(string))
+                                first = false
+                        case message.Field_BYTES:
+                                data := field.GetValue().([]byte)[:]
+                                writeStringField(first, &buf, *field.Name, base64.StdEncoding.EncodeToString(data))
+                                first = false
+                        case message.Field_INTEGER:
+                                writeRawField(first, &buf, *field.Name, strconv.FormatInt(field.GetValue().(int64), 10))
+                                first = false
+                        case message.Field_DOUBLE:
+                                writeRawField(first, &buf, *field.Name, strconv.FormatFloat(field.GetValue().(float64),
+                                        'g', -1, 64))
+                                first = false
+                        case message.Field_BOOL:
+                                writeRawField(first, &buf, *field.Name, strconv.FormatBool(field.GetValue().(bool)))
+                                first = false
+                        }
+                }
 	}
 	buf.WriteString(`}`) // end of fields
 	buf.WriteString(`}`)
@@ -481,21 +517,35 @@ func (c *CleanMessageFormatter) Format(m *message.Message) (doc []byte, err erro
 		case "hostname":
 			writeField(&buf, f, strconv.Quote(m.GetHostname()))
 		case "fields":
+                        raw := false
 			for _, field := range m.Fields {
-				switch field.GetValueType() {
-				case message.Field_STRING:
-					writeField(&buf, *field.Name, strconv.Quote(field.GetValue().(string)))
-				case message.Field_BYTES:
-					data := field.GetValue().([]byte)[:]
-					writeField(&buf, *field.Name, strconv.Quote(base64.StdEncoding.EncodeToString(data)))
-				case message.Field_INTEGER:
-					writeField(&buf, *field.Name, strconv.FormatInt(field.GetValue().(int64), 10))
-				case message.Field_DOUBLE:
-					writeField(&buf, *field.Name, strconv.FormatFloat(field.GetValue().(float64),
-						'g', -1, 64))
-				case message.Field_BOOL:
-					writeField(&buf, *field.Name, strconv.FormatBool(field.GetValue().(bool)))
-				}
+                                if len(c.rawBytesFields) > 0 {
+                                        for _, raw_field_name := range c.rawBytesFields {
+                                                if *field.Name == raw_field_name {
+                                                        raw = true
+                                                }
+                                        }
+                                }
+                                if raw {
+                                        data := field.GetValue().([]byte)[:]
+                                        writeField(&buf, *field.Name, string(data))
+                                        raw = false
+                                } else {
+                                        switch field.GetValueType() {
+                                        case message.Field_STRING:
+                                                writeField(&buf, *field.Name, strconv.Quote(field.GetValue().(string)))
+                                        case message.Field_BYTES:
+                                                data := field.GetValue().([]byte)[:]
+                                                writeField(&buf, *field.Name, strconv.Quote(base64.StdEncoding.EncodeToString(data)))
+                                        case message.Field_INTEGER:
+                                                writeField(&buf, *field.Name, strconv.FormatInt(field.GetValue().(int64), 10))
+                                        case message.Field_DOUBLE:
+                                                writeField(&buf, *field.Name, strconv.FormatFloat(field.GetValue().(float64),
+                                                        'g', -1, 64))
+                                        case message.Field_BOOL:
+                                                writeField(&buf, *field.Name, strconv.FormatBool(field.GetValue().(bool)))
+                                        }
+                                }
 			}
 		default:
 			// Search fo a given fields in the message
@@ -621,11 +671,15 @@ type HttpBulkIndexer struct {
 	// Maximum number of documents
 	MaxCount int
 	// Internal HTTP Client
-	client *http.Client
+	clientConn *httputil.ClientConn
+	// TCP Connection for HTTP client
+	tcpConn net.Conn
+	// Timeout in milliseconds for HTTP post
+	HTTPTimeout uint32
 }
 
-func NewHttpBulkIndexer(protocol string, domain string, maxCount int) *HttpBulkIndexer {
-	return &HttpBulkIndexer{Protocol: protocol, Domain: domain, MaxCount: maxCount}
+func NewHttpBulkIndexer(protocol string, domain string, maxCount int, http_timeout uint32) *HttpBulkIndexer {
+	return &HttpBulkIndexer{Protocol: protocol, Domain: domain, MaxCount: maxCount, HTTPTimeout: http_timeout}
 }
 
 func (h *HttpBulkIndexer) CheckFlush(count int, length int) bool {
@@ -636,8 +690,9 @@ func (h *HttpBulkIndexer) CheckFlush(count int, length int) bool {
 }
 
 func (h *HttpBulkIndexer) Index(body []byte) (success bool, err error) {
-	if h.client == nil {
-		h.client = &http.Client{}
+	if h.clientConn == nil {
+		h.tcpConn, _ = net.Dial("tcp", h.Domain)
+		h.clientConn = httputil.NewClientConn(h.tcpConn, nil)
 	}
 	url := fmt.Sprintf("%s://%s%s", h.Protocol, h.Domain, "/_bulk")
 
@@ -647,7 +702,19 @@ func (h *HttpBulkIndexer) Index(body []byte) (success bool, err error) {
 		return false, err
 	} else {
 		request.Header.Add("Accept", "application/json")
-		response, err := h.client.Do(request)
+		if h.HTTPTimeout != 0 {
+			h.tcpConn.SetDeadline(time.Now().Add(time.Duration(h.HTTPTimeout) * time.Millisecond))
+		}
+		response, err := h.clientConn.Do(request)
+
+		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+			//Post timed out. Close connection.
+			h.clientConn.Close()
+			h.clientConn = nil
+			err = fmt.Errorf("Bulk post connection has timed out: %s", err)
+			return false, err
+		} 
+ 
 		if err != nil {
 			err = fmt.Errorf("Error executing bulk request: %s", err)
 			return false, err

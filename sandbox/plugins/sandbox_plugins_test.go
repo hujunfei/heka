@@ -4,19 +4,23 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2014
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
 #   Mike Trinkala (trink@mozilla.com)
+#   Rob Miller (rmiller@mozilla.com)
 #
 # ***** END LICENSE BLOCK *****/
 
 package plugins
 
 import (
+	"bytes"
 	"code.google.com/p/go-uuid/uuid"
 	"code.google.com/p/gomock/gomock"
+	"code.google.com/p/goprotobuf/proto"
+	"encoding/json"
 	"fmt"
 	"github.com/mozilla-services/heka/message"
 	"github.com/mozilla-services/heka/pipeline"
@@ -36,6 +40,7 @@ func TestAllSpecs(t *testing.T) {
 
 	r.AddSpec(FilterSpec)
 	r.AddSpec(DecoderSpec)
+	r.AddSpec(EncoderSpec)
 
 	gs.MainGoTest(r, t)
 }
@@ -90,6 +95,11 @@ func FilterSpec(c gs.Context) {
 		pack := pipeline.NewPipelinePack(pConfig.InjectRecycleChan())
 		pack.Message = msg
 		pack.Decoded = true
+
+		c.Specify("Uninitialized", func() {
+			err := sbFilter.ReportMsg(msg)
+			c.Expect(err, gs.IsNil)
+		})
 
 		c.Specify("Over inject messages from ProcessMessage", func() {
 			var timer <-chan time.Time
@@ -405,6 +415,75 @@ func DecoderSpec(c gs.Context) {
 		})
 	})
 
+	c.Specify("Apache access log decoder", func() {
+		decoder := new(SandboxDecoder)
+		conf := decoder.ConfigStruct().(*sandbox.SandboxConfig)
+		conf.ScriptFilename = "../lua/decoders/apache_access.lua"
+		conf.ModuleDirectory = "../../../../../../modules"
+		conf.MemoryLimit = 8e6
+		conf.ScriptType = "lua"
+		conf.Config = make(map[string]interface{})
+		conf.Config["log_format"] = "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\""
+		conf.Config["user_agent_transform"] = true
+		supply := make(chan *pipeline.PipelinePack, 1)
+		pack := pipeline.NewPipelinePack(supply)
+		dRunner := pm.NewMockDecoderRunner(ctrl)
+		dRunner.EXPECT().Name().Return("SandboxDecoder")
+		err := decoder.Init(conf)
+		c.Assume(err, gs.IsNil)
+		decoder.SetDecoderRunner(dRunner)
+
+		c.Specify("decodes simple messages", func() {
+			data := "127.0.0.1 - - [10/Feb/2014:08:46:41 -0800] \"GET / HTTP/1.1\" 304 0 \"-\" \"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:26.0) Gecko/20100101 Firefox/26.0\""
+			pack.Message.SetPayload(data)
+			_, err = decoder.Decode(pack)
+			c.Assume(err, gs.IsNil)
+
+			c.Expect(pack.Message.GetTimestamp(),
+				gs.Equals,
+				int64(1392050801000000000))
+
+			c.Expect(pack.Message.GetSeverity(), gs.Equals, int32(7))
+
+			var ok bool
+			var value interface{}
+			value, ok = pack.Message.GetFieldValue("remote_addr")
+			c.Expect(ok, gs.Equals, true)
+			c.Expect(value, gs.Equals, "127.0.0.1")
+
+			value, ok = pack.Message.GetFieldValue("user_agent_browser")
+			c.Expect(ok, gs.Equals, true)
+			c.Expect(value, gs.Equals, "Firefox")
+			value, ok = pack.Message.GetFieldValue("user_agent_version")
+			c.Expect(ok, gs.Equals, true)
+			c.Expect(value, gs.Equals, float64(26))
+			value, ok = pack.Message.GetFieldValue("user_agent_os")
+			c.Expect(ok, gs.Equals, true)
+			c.Expect(value, gs.Equals, "Linux")
+			_, ok = pack.Message.GetFieldValue("http_user_agent")
+			c.Expect(ok, gs.Equals, false)
+
+			value, ok = pack.Message.GetFieldValue("body_bytes_sent")
+			c.Expect(ok, gs.Equals, true)
+			c.Expect(value, gs.Equals, float64(0))
+
+			value, ok = pack.Message.GetFieldValue("status")
+			c.Expect(ok, gs.Equals, true)
+			c.Expect(value, gs.Equals, float64(304))
+			decoder.Shutdown()
+		})
+
+		c.Specify("decodes an invalid messages", func() {
+			data := "bogus message"
+			pack.Message.SetPayload(data)
+			packs, err := decoder.Decode(pack)
+			c.Expect(len(packs), gs.Equals, 0)
+			c.Expect(err.Error(), gs.Equals, "Failed parsing: "+data)
+			c.Expect(decoder.processMessageFailures, gs.Equals, int64(1))
+			decoder.Shutdown()
+		})
+	})
+
 	c.Specify("rsyslog decoder", func() {
 		decoder := new(SandboxDecoder)
 		conf := decoder.ConfigStruct().(*sandbox.SandboxConfig)
@@ -424,7 +503,7 @@ func DecoderSpec(c gs.Context) {
 		decoder.SetDecoderRunner(dRunner)
 
 		c.Specify("decodes simple messages", func() {
-			data := "28 Feb 10 12:58:58 2014-02-10T12:58:59-08:00 testhost kernel: imklog 5.8.6, log source = /proc/kmsg started.\n"
+			data := "28 Feb 10 12:58:58 2014-02-10T12:58:59-08:00 testhost widget[4322]: test message.\n"
 			pack.Message.SetPayload(data)
 			_, err = decoder.Decode(pack)
 			c.Assume(err, gs.IsNil)
@@ -435,13 +514,14 @@ func DecoderSpec(c gs.Context) {
 
 			c.Expect(pack.Message.GetSeverity(), gs.Equals, int32(4))
 			c.Expect(pack.Message.GetHostname(), gs.Equals, "testhost")
-			c.Expect(pack.Message.GetPayload(), gs.Equals, "imklog 5.8.6, log source = /proc/kmsg started.")
+			c.Expect(pack.Message.GetPid(), gs.Equals, int32(4322))
+			c.Expect(pack.Message.GetPayload(), gs.Equals, "test message.")
 
 			var ok bool
 			var value interface{}
-			value, ok = pack.Message.GetFieldValue("syslogtag")
+			value, ok = pack.Message.GetFieldValue("programname")
 			c.Expect(ok, gs.Equals, true)
-			c.Expect(value, gs.Equals, "kernel:")
+			c.Expect(value, gs.Equals, "widget")
 
 			value, ok = pack.Message.GetFieldValue("syslogfacility")
 			c.Expect(ok, gs.Equals, true)
@@ -463,5 +543,116 @@ func DecoderSpec(c gs.Context) {
 			c.Expect(decoder.processMessageFailures, gs.Equals, int64(1))
 			decoder.Shutdown()
 		})
+	})
+}
+
+func EncoderSpec(c gs.Context) {
+	t := new(ts.SimpleT)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// NewPipelineConfig sets up Globals which is needed for the
+	// pipeline.Prepend*Dir functions to not die during plugin Init().
+	_ = pipeline.NewPipelineConfig(nil)
+
+	c.Specify("A SandboxEncoder", func() {
+
+		encoder := new(SandboxEncoder)
+		conf := encoder.ConfigStruct().(*SandboxEncoderConfig)
+		conf.ScriptType = "lua"
+		supply := make(chan *pipeline.PipelinePack, 1)
+		pack := pipeline.NewPipelinePack(supply)
+		pack.Message.SetPayload("original")
+		pack.Message.SetType("my_type")
+		pack.Message.SetPid(12345)
+		pack.Message.SetSeverity(4)
+		pack.Message.SetHostname("hostname")
+		pack.Message.SetTimestamp(54321)
+		pack.Message.SetUuid(uuid.NewRandom())
+		var (
+			result []byte
+			err    error
+		)
+
+		c.Specify("emits JSON correctly", func() {
+			conf.ScriptFilename = "../lua/testsupport/encoder_json.lua"
+			err = encoder.Init(conf)
+			c.Expect(err, gs.IsNil)
+			c.Expect(encoder.GeneratesProtobuf(), gs.IsFalse)
+
+			result, err = encoder.Encode(pack)
+			c.Expect(err, gs.IsNil)
+			msg := new(message.Message)
+			err = json.Unmarshal(result, msg)
+			c.Expect(err, gs.IsNil)
+			c.Expect(msg.GetTimestamp(), gs.Equals, int64(54321))
+			c.Expect(msg.GetPid(), gs.Equals, int32(12345))
+			c.Expect(msg.GetSeverity(), gs.Equals, int32(4))
+			c.Expect(msg.GetHostname(), gs.Equals, "hostname")
+			c.Expect(msg.GetPayload(), gs.Equals, "original")
+			c.Expect(msg.GetType(), gs.Equals, "my_type")
+		})
+
+		c.Specify("emits text correctly", func() {
+			conf.ScriptFilename = "../lua/testsupport/encoder_text.lua"
+			err = encoder.Init(conf)
+			c.Expect(err, gs.IsNil)
+
+			result, err = encoder.Encode(pack)
+			c.Expect(err, gs.IsNil)
+			c.Expect(string(result), gs.Equals, "Prefixed original")
+		})
+
+		c.Specify("emits protobuf correctly", func() {
+			conf.EmitsProtobuf = true
+			parser := pipeline.NewMessageProtoParser()
+
+			c.Specify("when inject_message is used", func() {
+				conf.ScriptFilename = "../lua/testsupport/encoder_protobuf.lua"
+				err = encoder.Init(conf)
+				c.Expect(err, gs.IsNil)
+				c.Expect(encoder.GeneratesProtobuf(), gs.IsTrue)
+
+				result, err = encoder.Encode(pack)
+				c.Expect(err, gs.IsNil)
+
+				buffer := bytes.NewBuffer(result)
+				_, record, e := parser.Parse(buffer)
+				c.Expect(e, gs.IsNil)
+				headerLen := int(record[1] + message.HEADER_FRAMING_SIZE)
+				record = record[headerLen:]
+
+				msg := new(message.Message)
+				err = proto.Unmarshal(record, msg)
+				c.Expect(err, gs.IsNil)
+				c.Expect(msg.GetTimestamp(), gs.Equals, int64(54321))
+				c.Expect(msg.GetPid(), gs.Equals, int32(12345))
+				c.Expect(msg.GetSeverity(), gs.Equals, int32(4))
+				c.Expect(msg.GetHostname(), gs.Equals, "hostname")
+				c.Expect(msg.GetPayload(), gs.Equals, "mutated")
+				c.Expect(msg.GetType(), gs.Equals, "after")
+			})
+
+			c.Specify("when `write_message` is used", func() {
+				conf.ScriptFilename = "../lua/testsupport/encoder_writemessage.lua"
+				err = encoder.Init(conf)
+				c.Expect(err, gs.IsNil)
+				c.Expect(encoder.GeneratesProtobuf(), gs.IsTrue)
+
+				result, err = encoder.Encode(pack)
+				c.Expect(err, gs.IsNil)
+				buffer := bytes.NewBuffer(result)
+				_, record, e := parser.Parse(buffer)
+				c.Expect(e, gs.IsNil)
+				headerLen := int(record[1] + message.HEADER_FRAMING_SIZE)
+				record = record[headerLen:]
+
+				msg := new(message.Message)
+				err = proto.Unmarshal(record, msg)
+				c.Expect(err, gs.IsNil)
+				c.Expect(msg.GetPayload(), gs.Equals, "mutated payload")
+			})
+		})
+
 	})
 }

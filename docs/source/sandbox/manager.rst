@@ -12,7 +12,7 @@ Starting a SandboxFilter
 - Type: "heka.control.sandbox"
 - Payload: *sandbox code*
 - Fields[action]: "load"
-- Fields[config]: the TOML configuration for the SandboxFilter :ref:`sandboxfilter_settings`
+- Fields[config]: the TOML configuration for the :ref:`config_sandbox_filter`
 
 Stopping a SandboxFilter
 
@@ -97,7 +97,6 @@ case we will use the same name for each.
     [PlatformDevs]
     type = "SandboxManagerFilter"
     message_signer = "PlatformDevs"
-    message_matcher = "Type == 'heka.control.sandbox'"
     working_directory = "/var/heka/sandbox"
     max_filters = 100
 
@@ -115,6 +114,8 @@ the rollout  of new keys.
 
     [TCP:5565]
     type = "TcpInput"
+    parser_type = "message.proto"
+    decoder = "ProtobufDecoder"
     address = ":5565"
         [TCP:5565.signer.PlatformDevs_0]
         hmac_key = "Old Platform devs signing key"
